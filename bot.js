@@ -2,61 +2,110 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const fs = require('fs');
 
+// ============================================================
+//                    CONFIGURATION
+// ============================================================
 const BOT_TOKEN    = process.env.BOT_TOKEN;
 const BOT_USERNAME = process.env.BOT_USERNAME;
-const SECRET_CMD   = process.env.SECRET_CMD || 'panel777';
+const ADMIN_IDS    = (process.env.ADMIN_IDS || '')
+  .split(',')
+  .map(id => id.trim())
+  .filter(Boolean);
 
 if (!BOT_TOKEN || !BOT_USERNAME) {
-  console.error('❌ .env: BOT_TOKEN va BOT_USERNAME kerak!');
+  console.error('❌ .env faylida BOT_TOKEN va BOT_USERNAME bo\'lishi kerak!');
   process.exit(1);
+}
+
+if (ADMIN_IDS.length === 0) {
+  console.warn('⚠️  .env faylida ADMIN_IDS belgilanmagan! Hech kim /admin panelga kira olmaydi.');
+}
+
+function isAdmin(userId) {
+  return ADMIN_IDS.includes(String(userId));
 }
 
 const bot = new Telegraf(BOT_TOKEN);
 
+// Faqat ADMIN_IDS dagi foydalanuvchilar admin_* va rch_* tugmalaridan foydalana oladi
+bot.use(async (ctx, next) => {
+  const data = ctx.callbackQuery && ctx.callbackQuery.data;
+  if (data && (data.startsWith('admin_') || data.startsWith('rch_'))) {
+    if (!isAdmin(ctx.from.id)) {
+      return ctx.answerCbQuery('🚫 Sizda ruxsat yo\'q.', { show_alert: true });
+    }
+  }
+  return next();
+});
+
 // ============================================================
 //                      JSON DATABASE
 // ============================================================
-function loadJSON(f, d) {
+const USERS_FILE    = './users.json';
+const BATTLES_FILE  = './battles.json';
+const SETTINGS_FILE = './settings.json';
+
+function loadJSON(file, defaultVal) {
   try {
-    if (!fs.existsSync(f)) { fs.writeFileSync(f, JSON.stringify(d, null, 2)); return d; }
-    return JSON.parse(fs.readFileSync(f, 'utf8'));
-  } catch (e) { console.error(`[DB] ${f}:`, e.message); return d; }
-}
-function saveJSON(f, d) {
-  try { fs.writeFileSync(f, JSON.stringify(d, null, 2)); }
-  catch (e) { console.error(`[DB] save:`, e.message); }
+    if (!fs.existsSync(file)) {
+      fs.writeFileSync(file, JSON.stringify(defaultVal, null, 2));
+      return defaultVal;
+    }
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    console.error(`[DB] ${file} xato:`, e.message);
+    return defaultVal;
+  }
 }
 
-let users    = loadJSON('./users.json',    {});
-let battles  = loadJSON('./battles.json',  {});
-let settings = loadJSON('./settings.json', { requiredChannels: [] });
-let admins   = loadJSON('./admins.json',   []);
+function saveJSON(file, data) {
+  try { fs.writeFileSync(file, JSON.stringify(data, null, 2)); }
+  catch (e) { console.error(`[DB] save xato:`, e.message); }
+}
 
-const saveUsers    = () => saveJSON('./users.json',    users);
-const saveBattles  = () => saveJSON('./battles.json',  battles);
-const saveSettings = () => saveJSON('./settings.json', settings);
-const saveAdmins   = () => saveJSON('./admins.json',   admins);
+let users    = loadJSON(USERS_FILE,    {});
+let battles  = loadJSON(BATTLES_FILE,  {});
+let settings = loadJSON(SETTINGS_FILE, { requiredChannels: [] });
+
+const saveUsers    = () => saveJSON(USERS_FILE,    users);
+const saveBattles  = () => saveJSON(BATTLES_FILE,  battles);
+const saveSettings = () => saveJSON(SETTINGS_FILE, settings);
 
 // ============================================================
-//                       HELPERS
+//                    USER HELPERS
 // ============================================================
-const isAdmin = (id) => admins.includes(Number(id)) || admins.includes(String(id));
-
 function getUser(ctx) {
   const id    = String(ctx.from.id);
   const uname = ctx.from.username || null;
   if (!users[id]) {
     users[id] = {
-      id: ctx.from.id, username: uname, wins: 0, loses: 0,
-      votes: 0, banned: false, createdBattles: 0, joinedBattles: 0
+      id: ctx.from.id, username: uname,
+      wins: 0, loses: 0, votes: 0, banned: false,
+      createdBattles: 0, joinedBattles: 0
     };
     saveUsers();
   }
-  if (uname && users[id].username !== uname) { users[id].username = uname; saveUsers(); }
+  if (uname && users[id].username !== uname) {
+    users[id].username = uname;
+    saveUsers();
+  }
   return users[id];
 }
 
-function getVotes(battle, username) {
+function findUserByQuery(query) {
+  const q = query.replace('@', '').toLowerCase().trim();
+  if (users[q]) return users[q];
+  return Object.values(users).find(u => u.username && u.username.toLowerCase() === q) || null;
+}
+
+// ============================================================
+//                   BATTLE HELPERS
+// ============================================================
+function generateId() {
+  return Math.random().toString(36).substr(2, 8) + Date.now().toString(36);
+}
+
+function getVotesForParticipant(battle, username) {
   return Object.values(battle.votes).filter(v => v.toLowerCase() === username.toLowerCase()).length;
 }
 
@@ -64,55 +113,42 @@ function getBattlesByOwner(ownerId) {
   return Object.values(battles).filter(b => b.owner === ownerId);
 }
 
-function findUserByQuery(q) {
-  q = q.replace('@', '').toLowerCase().trim();
-  if (users[q]) return users[q];
-  return Object.values(users).find(u => u.username && u.username.toLowerCase() === q) || null;
+// ============================================================
+//                  SUBSCRIPTION CHECK
+// ============================================================
+async function isMemberOf(userId, channel) {
+  try {
+    const m = await bot.telegram.getChatMember(channel, userId);
+    return !['left', 'kicked'].includes(m.status);
+  } catch (e) {
+    return true; // bot kanalda emas, skip
+  }
 }
 
-// ============================================================
-//          SUBSCRIPTION CHECKS
-// ============================================================
-
-// Bot majburiy kanallarini tekshirish
 async function checkRequiredChannels(userId) {
   if (!settings.requiredChannels || settings.requiredChannels.length === 0) return true;
   for (const ch of settings.requiredChannels) {
-    try {
-      const m = await bot.telegram.getChatMember(ch, userId);
-      if (['left', 'kicked'].includes(m.status)) return false;
-    } catch (e) {}
+    if (!await isMemberOf(userId, ch)) return false;
   }
   return true;
 }
 
-// Battle kanalini tekshirish
-async function checkBattleChannel(userId, channel) {
-  try {
-    const m = await bot.telegram.getChatMember(channel, userId);
-    return !['left', 'kicked'].includes(m.status);
-  } catch (e) { return true; }
-}
-
-// Majburiy kanallar tugmalari
-function requiredChannelKeyboard(extra) {
-  const btns = (settings.requiredChannels || []).map(ch => [
-    Markup.button.url(`📢 ${ch} ga obuna bo'lish`, `https://t.me/${ch.replace('@', '')}`)
-  ]);
-  if (extra) btns.push([Markup.button.callback('✅ Obunani tekshirish', extra)]);
-  return Markup.inlineKeyboard(btns);
+async function checkBattleChannel(userId, battleChannel) {
+  return await isMemberOf(userId, battleChannel);
 }
 
 // ============================================================
-//               POST BUILDER
+//                    POST BUILDING
 // ============================================================
-function buildPost(battle) {
+function buildBattlePost(battle) {
   const sorted = battle.participants
-    .map(u => ({ username: u, count: getVotes(battle, u) }))
+    .map(u => ({ username: u, count: getVotesForParticipant(battle, u) }))
     .sort((a, b) => b.count - a.count);
 
   let text = `🏆 <b>BATTLE BOSHLANDI</b>\n\n`;
-  text += `❗ <b>Shartlar:</b>\n• Kanalga obuna bo'lish\n• Do'stlarni chaqirish\n\n`;
+  text += `❗ <b>Shartlar:</b>\n`;
+  text += `• Kanalga obuna bo'lish\n`;
+  text += `• Do'stlarni chaqirish\n\n`;
   text += `🎁 <b>Sovrin:</b>\n${battle.text}\n\n`;
   text += `🎯 <b>Maqsad:</b> ${battle.target} ta ovoz\n\n`;
   text += `📈 <b>Reyting:</b>\n\n`;
@@ -121,68 +157,74 @@ function buildPost(battle) {
     text += `Hali ishtirokchilar yo'q\n`;
   } else {
     sorted.forEach((p, i) => {
-      const m = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
-      text += `${m} @${p.username} — ${p.count} 📦\n`;
+      const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
+      text += `${medal} @${p.username} — ${p.count} 📦\n`;
     });
   }
   return text;
 }
 
-// MUHIM: URL da battleId ishlatamiz, channel emas!
-// Format: vote-{battleId}-{username}
-// battleId alphanumeric (dash yo'q), username faqat harf/raqam/_ (dash yo'q)
-// Shuning uchun birinchi dash aniq ajratadi
-function buildKeyboard(battle) {
+function buildBattleKeyboard(battle) {
   const sorted = battle.participants
-    .map(u => ({ username: u, count: getVotes(battle, u) }))
+    .map(u => ({ username: u, count: getVotesForParticipant(battle, u) }))
     .sort((a, b) => b.count - a.count);
 
-  const btns = [];
+  const buttons = [];
   sorted.forEach(p => {
-    btns.push([Markup.button.url(
+    buttons.push([Markup.button.url(
       `@${p.username} — ${p.count} 📦`,
-      `https://t.me/${BOT_USERNAME}?start=vote-${battle.battleId}-${p.username}`
+      `https://t.me/${BOT_USERNAME}?start=vote-${battle.channel.replace('@', '')}-${p.username}`
     )]);
   });
 
-  btns.push([Markup.button.url(
+  buttons.push([Markup.button.url(
     '🏆 KONKURSGA QO\'SHILISH',
     `https://t.me/${BOT_USERNAME}?start=join-${battle.battleId}`
   )]);
-  btns.push([Markup.button.url(
+  buttons.push([Markup.button.url(
     '📊 NATIJALAR',
-    `https://t.me/${BOT_USERNAME}?start=res-${battle.battleId}`
+    `https://t.me/${BOT_USERNAME}?start=results-${battle.battleId}`
   )]);
 
-  return Markup.inlineKeyboard(btns);
+  return Markup.inlineKeyboard(buttons);
 }
 
-async function updatePost(battle) {
+async function updateBattlePost(battle) {
   if (!battle.messageId || !battle.channel) return;
   try {
     await bot.telegram.editMessageText(
       battle.channel, battle.messageId, null,
-      buildPost(battle),
-      { parse_mode: 'HTML', reply_markup: buildKeyboard(battle).reply_markup }
+      buildBattlePost(battle),
+      { parse_mode: 'HTML', reply_markup: buildBattleKeyboard(battle).reply_markup }
     );
-  } catch (e) { console.log('[POST]', e.message); }
+  } catch (e) {
+    console.log('[POST] edit xato:', e.message);
+  }
 }
 
 // ============================================================
-//               DECLARE WINNER
+//                   DECLARE WINNER
 // ============================================================
 async function declareWinner(battle, winnerUsername) {
   battle.active = false;
   saveBattles();
 
-  Object.values(users).forEach(u => {
-    if (u.username && battle.participants.some(p => p.toLowerCase() === u.username.toLowerCase())) {
-      const isWinner = u.username.toLowerCase() === winnerUsername.toLowerCase();
-      if (isWinner) users[String(u.id)].wins = (u.wins || 0) + 1;
-      else          users[String(u.id)].loses = (u.loses || 0) + 1;
+  const winnerEntry = Object.values(users).find(
+    u => u.username && u.username.toLowerCase() === winnerUsername.toLowerCase()
+  );
+  if (winnerEntry) {
+    users[String(winnerEntry.id)].wins = (winnerEntry.wins || 0) + 1;
+    saveUsers();
+  }
+
+  battle.participants.forEach(uname => {
+    if (uname.toLowerCase() !== winnerUsername.toLowerCase()) {
+      const loser = Object.values(users).find(
+        u => u.username && u.username.toLowerCase() === uname.toLowerCase()
+      );
+      if (loser) { users[String(loser.id)].loses = (loser.loses || 0) + 1; saveUsers(); }
     }
   });
-  saveUsers();
 
   try {
     await bot.telegram.sendMessage(
@@ -190,7 +232,7 @@ async function declareWinner(battle, winnerUsername) {
       `🏆 <b>BATTLE TUGADI</b>\n\n🥇 <b>G'olib:</b> @${winnerUsername}\n\n🎉 <b>Tabriklaymiz!</b>\n🎁 Sovrin: ${battle.text}`,
       { parse_mode: 'HTML' }
     );
-  } catch (e) {}
+  } catch (e) { console.log('[WINNER] kanal xato:', e.message); }
 
   try {
     await bot.telegram.sendMessage(
@@ -202,389 +244,203 @@ async function declareWinner(battle, winnerUsername) {
 }
 
 // ============================================================
-//               STATE MACHINE
+//                  STATE MACHINE
 // ============================================================
-const states     = {};
-const setState   = (id, s) => { states[String(id)] = s; };
-const getState   = (id)    => states[String(id)] || null;
-const clearState = (id)    => { delete states[String(id)]; };
+const userStates = {};
+const setState   = (uid, s)  => { userStates[String(uid)] = s; };
+const getState   = (uid)     => userStates[String(uid)] || null;
+const clearState = (uid)     => { delete userStates[String(uid)]; };
 
 // ============================================================
-//               KEYBOARDS
+//                    KEYBOARDS
 // ============================================================
 const mainMenu  = () => Markup.keyboard([
   ['🏆 Battle yaratish', '📋 Battlelarim'],
-  ['📊 Statistika',       'ℹ️ Yordam']
+  ['📊 Statistika', 'ℹ️ Yordam']
 ]).resize();
 
 const cancelMenu = () => Markup.keyboard([['❌ Bekor qilish']]).resize();
 
+const adminPanel = () => Markup.inlineKeyboard([
+  [Markup.button.callback('📢 Broadcast', 'admin_broadcast')],
+  [Markup.button.callback('🚫 Ban', 'admin_ban'), Markup.button.callback('✅ Unban', 'admin_unban')],
+  [Markup.button.callback('📊 Statistika', 'admin_stats')],
+  [Markup.button.callback('📋 Battlelar', 'admin_battles')],
+  [Markup.button.callback('➕ Kanal qo\'shish', 'admin_add_channel'),
+   Markup.button.callback('➖ Kanal o\'chirish', 'admin_remove_channel')]
+]);
+
 // ============================================================
-//                       /start
+//                      /start
 // ============================================================
 bot.start(async (ctx) => {
-  const user    = getUser(ctx);
+  const user = getUser(ctx);
   if (user.banned) return ctx.reply('🚫 Siz ban qilingansiz.');
 
   const payload = ctx.startPayload || '';
 
-  // ── vote-{battleId}-{username} ─────────────────────────
   if (payload.startsWith('vote-')) {
-    const rest = payload.slice(5);           // {battleId}-{username}
-    const idx  = rest.indexOf('-');
-    if (idx !== -1) {
-      const battleId      = rest.slice(0, idx);
-      const targetUsername = rest.slice(idx + 1);
-      return handleVote(ctx, battleId, targetUsername);
+    const rest  = payload.slice(5);
+    const dash  = rest.indexOf('-');
+    if (dash !== -1) {
+      return handleVote(ctx, rest.slice(0, dash), rest.slice(dash + 1));
     }
   }
-
-  // ── join-{battleId} ────────────────────────────────────
-  if (payload.startsWith('join-')) {
-    return handleJoin(ctx, payload.slice(5));
-  }
-
-  // ── res-{battleId} ─────────────────────────────────────
-  if (payload.startsWith('res-')) {
-    return handleResults(ctx, payload.slice(4));
-  }
-
-  // ── Oddiy /start — majburiy kanallarni tekshir ─────────
-  const subOk = await checkRequiredChannels(ctx.from.id);
-  if (!subOk) {
-    return ctx.reply(
-      `👋 Salom <b>${ctx.from.first_name}</b>!\n\n` +
-      `⚠️ Botdan foydalanish uchun avval quyidagi kanallarga obuna bo'ling:`,
-      { parse_mode: 'HTML', ...requiredChannelKeyboard('check_start') }
-    );
-  }
+  if (payload.startsWith('join-'))    return handleJoin(ctx, payload.slice(5));
+  if (payload.startsWith('results-')) return handleResults(ctx, payload.slice(8));
 
   await ctx.reply(
     `👋 Salom, <b>${ctx.from.first_name}</b>!\n\n` +
-    `🏆 <b>Stars Battle Bot</b>ga xush kelibsiz!\n\n` +
+    `🏆 <b>Ovoz Battle Bot</b>ga xush kelibsiz!\n\n` +
     `Battle yarating va do'stlaringiz bilan raqobatlashing!`,
     { parse_mode: 'HTML', ...mainMenu() }
   );
 });
 
-bot.action('check_start', async (ctx) => {
-  await ctx.answerCbQuery('Tekshirilmoqda...');
-  const ok = await checkRequiredChannels(ctx.from.id);
-  if (!ok) {
-    return ctx.answerCbQuery('❌ Hali kanallarga obuna bo\'lmadingiz!', true);
-  }
-  try { await ctx.deleteMessage(); } catch (e) {}
-  await ctx.reply(
-    `✅ Obuna tasdiqlandi!\n\n👋 <b>${ctx.from.first_name}</b>, xush kelibsiz!`,
-    { parse_mode: 'HTML', ...mainMenu() }
-  );
-});
-
 // ============================================================
-//               VOTE HANDLER
+//                   VOTE HANDLER
 // ============================================================
-async function handleVote(ctx, battleId, targetUsername) {
-  const user = getUser(ctx);
-  if (user.banned) return ctx.reply('🚫 Siz ban qilingansiz.');
+async function handleVote(ctx, channelPart, targetUsername) {
+  const voter = getUser(ctx);
+  if (voter.banned) return ctx.reply('🚫 Siz ban qilingansiz.');
 
   const voterUsername = ctx.from.username;
-  if (!voterUsername) return ctx.reply('❌ Avval Telegram username o\'rnating.');
+  if (!voterUsername) return ctx.reply('❌ Avval username o\'rnating.');
 
-  // Battle topish
-  const battle = battles[battleId];
-  if (!battle) return ctx.reply('❌ Battle topilmadi.');
-  if (!battle.active) return ctx.reply('❌ Bu battle tugagan.');
+  // Find battle
+  const battle = Object.values(battles).find(
+    b => b.channel.replace('@', '').toLowerCase() === channelPart.toLowerCase() && b.active
+  );
+  if (!battle) return ctx.reply('❌ Aktiv battle topilmadi yoki battle tugagan.');
 
-  // O'ziga ovoz bermaslik
+  // Can't vote for yourself
   if (voterUsername.toLowerCase() === targetUsername.toLowerCase()) {
     return ctx.reply('❌ O\'zingizga ovoz bera olmaysiz.');
   }
 
-  // Ishtirokchi borligini tekshirish
-  const participantExists = battle.participants.some(
-    p => p.toLowerCase() === targetUsername.toLowerCase()
-  );
-  if (!participantExists) {
-    return ctx.reply(
-      `❌ @${targetUsername} bu battleda ishtirokchi emas.\n\n` +
-      `Avval ishtirokchi bo'lish uchun <b>Konkursga qo'shilish</b> tugmasini bosish kerak.`,
-      { parse_mode: 'HTML' }
-    );
-  }
+  // Target must be participant
+  const exists = battle.participants.some(p => p.toLowerCase() === targetUsername.toLowerCase());
+  if (!exists) return ctx.reply('❌ Bu ishtirokchi battleda yo\'q.');
 
   const voterId = String(ctx.from.id);
 
-  // Oldin ovoz berganligini tekshirish
+  // Already voted
   if (battle.votes[voterId]) {
     const prev = battle.votes[voterId];
     if (prev.toLowerCase() === targetUsername.toLowerCase()) {
       return ctx.reply(`❌ Siz allaqachon @${targetUsername}ga ovoz bergansiz.`);
     }
-    return ctx.reply(`❌ Siz bu battleda allaqachon @${prev}ga ovoz bergansiz.\nBir battleda faqat 1 ta odamga ovoz beriladi.`);
+    return ctx.reply(`❌ Siz bu battleda allaqachon @${prev}ga ovoz bergansiz.\nBir battleda faqat bitta odamga ovoz beriladi.`);
   }
 
-  // ─── 1-QADAM: Bot majburiy kanallarini tekshirish ────────
-  const reqOk = await checkRequiredChannels(ctx.from.id);
-  if (!reqOk) {
-    // callbackData uchun battleId va username saqlash (state orqali)
-    setState(ctx.from.id, { pendingVote: { battleId, targetUsername } });
+  // --- CHECK BATTLE CHANNEL SUBSCRIPTION ---
+  const inBattleChannel = await checkBattleChannel(ctx.from.id, battle.channel);
+  if (!inBattleChannel) {
+    const channelLink = `https://t.me/${battle.channel.replace('@', '')}`;
     return ctx.reply(
-      `❌ Ovoz berish uchun avval majburiy kanallarga obuna bo'ling:`,
-      requiredChannelKeyboard('chk_req_then_vote')
-    );
-  }
-
-  // ─── 2-QADAM: Battle kanalini tekshirish ─────────────────
-  const battleChOk = await checkBattleChannel(ctx.from.id, battle.channel);
-  if (!battleChOk) {
-    setState(ctx.from.id, { pendingVote: { battleId, targetUsername } });
-    return ctx.reply(
-      `❌ Ovoz berish uchun avval battle kanali ${battle.channel} ga obuna bo'ling:`,
+      `❌ Ovoz berish uchun avval ${battle.channel} kanaliga obuna bo'ling!`,
       Markup.inlineKeyboard([
-        [Markup.button.url(
-          `📢 ${battle.channel} ga obuna bo'lish`,
-          `https://t.me/${battle.channel.replace('@', '')}`
-        )],
-        [Markup.button.callback('✅ Obunani tekshirish', 'chk_battle_then_vote')]
+        [Markup.button.url(`📢 ${battle.channel} ga obuna bo'lish`, channelLink)],
+        [Markup.button.callback('✅ Obunani tekshirish', `chk_vote_${channelPart}_${targetUsername}`)]
       ])
     );
   }
 
-  // ─── OVOZ BERISH ──────────────────────────────────────────
-  await doVote(ctx, battle, voterId, targetUsername);
-}
+  // --- CHECK REQUIRED CHANNELS ---
+  const reqOk = await checkRequiredChannels(ctx.from.id);
+  if (!reqOk) {
+    const buttons = settings.requiredChannels.map(ch => [
+      Markup.button.url(`📢 ${ch}`, `https://t.me/${ch.replace('@', '')}`)
+    ]);
+    buttons.push([Markup.button.callback('✅ Obunani tekshirish', `chk_vote_${channelPart}_${targetUsername}`)]);
+    return ctx.reply('❌ Majburiy kanallarga obuna bo\'ling:', Markup.inlineKeyboard(buttons));
+  }
 
-async function doVote(ctx, battle, voterId, targetUsername) {
+  // VOTE!
   battle.votes[voterId] = targetUsername;
-  users[voterId].votes  = (users[voterId].votes || 0) + 1;
+  users[voterId].votes = (users[voterId].votes || 0) + 1;
   saveBattles();
   saveUsers();
-  clearState(ctx.from.id);
 
-  await ctx.reply(
-    `✅ @${targetUsername}ga ovoz berdingiz! 📦\n\n` +
-    `💡 Havolani do'stlaringizga yuboring, ulardanam ovoz oling!`,
-    mainMenu()
-  );
+  await ctx.reply(`✅ @${targetUsername}ga ovoz berdingiz! 📦`, mainMenu());
+  await updateBattlePost(battle);
 
-  await updatePost(battle);
-
-  const count = getVotes(battle, targetUsername);
+  const count = getVotesForParticipant(battle, targetUsername);
   if (count >= battle.target) {
     await declareWinner(battle, targetUsername);
   }
 }
 
-// ─── Majburiy kanal tekshirgandan keyin ovoz ──────────────
-bot.action('chk_req_then_vote', async (ctx) => {
-  await ctx.answerCbQuery('Tekshirilmoqda...');
-  const state = getState(ctx.from.id);
-  if (!state?.pendingVote) return ctx.reply('❌ Ma\'lumot topilmadi. Qayta bosing.', mainMenu());
-
-  const reqOk = await checkRequiredChannels(ctx.from.id);
-  if (!reqOk) return ctx.answerCbQuery('❌ Hali obuna bo\'lmadingiz!', true);
-
-  const { battleId, targetUsername } = state.pendingVote;
-  const battle = battles[battleId];
-  if (!battle || !battle.active) {
-    clearState(ctx.from.id);
-    try { await ctx.deleteMessage(); } catch (e) {}
-    return ctx.reply('❌ Battle topilmadi yoki tugagan.', mainMenu());
-  }
-
-  // Endi battle kanalini tekshir
-  const battleChOk = await checkBattleChannel(ctx.from.id, battle.channel);
-  if (!battleChOk) {
-    try { await ctx.deleteMessage(); } catch (e) {}
-    return ctx.reply(
-      `❌ Endi battle kanali ${battle.channel} ga obuna bo'ling:`,
-      Markup.inlineKeyboard([
-        [Markup.button.url(
-          `📢 ${battle.channel} ga obuna bo'lish`,
-          `https://t.me/${battle.channel.replace('@', '')}`
-        )],
-        [Markup.button.callback('✅ Obunani tekshirish', 'chk_battle_then_vote')]
-      ])
-    );
-  }
-
-  try { await ctx.deleteMessage(); } catch (e) {}
-  const voterId = String(ctx.from.id);
-  if (battle.votes[voterId]) {
-    clearState(ctx.from.id);
-    return ctx.reply(`❌ Siz allaqachon @${battle.votes[voterId]}ga ovoz bergansiz.`, mainMenu());
-  }
-  await doVote(ctx, battle, voterId, targetUsername);
-});
-
-// ─── Battle kanal tekshirgandan keyin ovoz ────────────────
-bot.action('chk_battle_then_vote', async (ctx) => {
-  await ctx.answerCbQuery('Tekshirilmoqda...');
-  const state = getState(ctx.from.id);
-  if (!state?.pendingVote) return ctx.reply('❌ Ma\'lumot topilmadi. Qayta bosing.', mainMenu());
-
-  const { battleId, targetUsername } = state.pendingVote;
-  const battle = battles[battleId];
-  if (!battle || !battle.active) {
-    clearState(ctx.from.id);
-    try { await ctx.deleteMessage(); } catch (e) {}
-    return ctx.reply('❌ Battle topilmadi yoki tugagan.', mainMenu());
-  }
-
-  const battleChOk = await checkBattleChannel(ctx.from.id, battle.channel);
-  if (!battleChOk) return ctx.answerCbQuery(`❌ Hali ${battle.channel} ga obuna bo'lmadingiz!`, true);
-
-  try { await ctx.deleteMessage(); } catch (e) {}
-  const voterId = String(ctx.from.id);
-  if (battle.votes[voterId]) {
-    clearState(ctx.from.id);
-    return ctx.reply(`❌ Siz allaqachon @${battle.votes[voterId]}ga ovoz bergansiz.`, mainMenu());
-  }
-  await doVote(ctx, battle, voterId, targetUsername);
-});
-
 // ============================================================
-//               JOIN HANDLER
+//                   JOIN HANDLER
 // ============================================================
 async function handleJoin(ctx, battleId) {
-  const user     = getUser(ctx);
+  const user = getUser(ctx);
   if (user.banned) return ctx.reply('🚫 Siz ban qilingansiz.');
 
   const username = ctx.from.username;
-  if (!username) return ctx.reply('❌ Avval Telegram username o\'rnating.');
+  if (!username) return ctx.reply('❌ Avval username o\'rnating.');
 
   const battle = battles[battleId];
   if (!battle) return ctx.reply('❌ Battle topilmadi.');
   if (!battle.active) return ctx.reply('❌ Bu battle tugagan.');
 
-  // Allaqachon ishtirokchimi
-  if (battle.participants.some(p => p.toLowerCase() === username.toLowerCase())) {
-    const voteLink = `https://t.me/${BOT_USERNAME}?start=vote-${battle.battleId}-${username}`;
+  // Check battle channel subscription
+  const inBattleChannel = await checkBattleChannel(ctx.from.id, battle.channel);
+  if (!inBattleChannel) {
+    const channelLink = `https://t.me/${battle.channel.replace('@', '')}`;
     return ctx.reply(
-      `✅ Siz allaqachon bu battledasiz!\n\n🔗 Sizning ovoz havolangiz:\n<code>${voteLink}</code>`,
-      { parse_mode: 'HTML', disable_web_page_preview: true }
-    );
-  }
-
-  // ─── 1-QADAM: Majburiy kanallar ──────────────────────────
-  const reqOk = await checkRequiredChannels(ctx.from.id);
-  if (!reqOk) {
-    setState(ctx.from.id, { pendingJoin: battleId });
-    return ctx.reply(
-      `❌ Battlega qo'shilish uchun avval majburiy kanallarga obuna bo'ling:`,
-      requiredChannelKeyboard('chk_req_then_join')
-    );
-  }
-
-  // ─── 2-QADAM: Battle kanali ───────────────────────────────
-  const battleChOk = await checkBattleChannel(ctx.from.id, battle.channel);
-  if (!battleChOk) {
-    setState(ctx.from.id, { pendingJoin: battleId });
-    return ctx.reply(
-      `❌ Battlega qo'shilish uchun avval ${battle.channel} ga obuna bo'ling:`,
+      `❌ Battlega qo'shilish uchun avval ${battle.channel} kanaliga obuna bo'ling!`,
       Markup.inlineKeyboard([
-        [Markup.button.url(
-          `📢 ${battle.channel} ga obuna bo'lish`,
-          `https://t.me/${battle.channel.replace('@', '')}`
-        )],
-        [Markup.button.callback('✅ Obunani tekshirish', 'chk_battle_then_join')]
+        [Markup.button.url(`📢 ${battle.channel} ga obuna bo'lish`, channelLink)],
+        [Markup.button.callback('✅ Obunani tekshirish', `chk_join_${battleId}`)]
       ])
     );
   }
 
-  await doJoin(ctx, battle, username);
-}
+  // Check required channels
+  const reqOk = await checkRequiredChannels(ctx.from.id);
+  if (!reqOk) {
+    const buttons = settings.requiredChannels.map(ch => [
+      Markup.button.url(`📢 ${ch}`, `https://t.me/${ch.replace('@', '')}`)
+    ]);
+    buttons.push([Markup.button.callback('✅ Obunani tekshirish', `chk_join_${battleId}`)]);
+    return ctx.reply('❌ Majburiy kanallarga obuna bo\'ling:', Markup.inlineKeyboard(buttons));
+  }
 
-async function doJoin(ctx, battle, username) {
+  if (battle.participants.some(p => p.toLowerCase() === username.toLowerCase())) {
+    const voteLink = `https://t.me/${BOT_USERNAME}?start=vote-${battle.channel.replace('@', '')}-${username}`;
+    return ctx.reply(
+      `✅ Siz allaqachon bu battledasiz!\n\n🔗 Sizning ovoz havolangiz:\n${voteLink}`,
+      { disable_web_page_preview: true }
+    );
+  }
+
   battle.participants.push(username);
   const uid = String(ctx.from.id);
   users[uid].joinedBattles = (users[uid].joinedBattles || 0) + 1;
   saveBattles();
   saveUsers();
-  clearState(ctx.from.id);
 
-  const voteLink = `https://t.me/${BOT_USERNAME}?start=vote-${battle.battleId}-${username}`;
+  const voteLink = `https://t.me/${BOT_USERNAME}?start=vote-${battle.channel.replace('@', '')}-${username}`;
   await ctx.reply(
     `✅ Battlega muvaffaqiyatli qo'shildingiz!\n\n` +
-    `🔗 <b>Sizning ovoz havolangiz:</b>\n<code>${voteLink}</code>\n\n` +
-    `📤 Havolani do'stlaringizga yuboring va ovoz yig'ing! 📦`,
+    `🔗 <b>Sizning ovoz havolangiz:</b>\n${voteLink}\n\n` +
+    `Havolani do'stlaringizga yuboring va ovoz yig'ing! 📦`,
     { parse_mode: 'HTML', disable_web_page_preview: true }
   );
-
-  await updatePost(battle);
+  await updateBattlePost(battle);
 }
 
-// ─── Majburiy kanal tekshirgandan keyin join ──────────────
-bot.action('chk_req_then_join', async (ctx) => {
-  await ctx.answerCbQuery('Tekshirilmoqda...');
-  const state = getState(ctx.from.id);
-  if (!state?.pendingJoin) return ctx.reply('❌ Ma\'lumot topilmadi.', mainMenu());
-
-  const reqOk = await checkRequiredChannels(ctx.from.id);
-  if (!reqOk) return ctx.answerCbQuery('❌ Hali obuna bo\'lmadingiz!', true);
-
-  const battle = battles[state.pendingJoin];
-  if (!battle || !battle.active) {
-    clearState(ctx.from.id); try { await ctx.deleteMessage(); } catch(e) {}
-    return ctx.reply('❌ Battle topilmadi yoki tugagan.', mainMenu());
-  }
-
-  const battleChOk = await checkBattleChannel(ctx.from.id, battle.channel);
-  if (!battleChOk) {
-    try { await ctx.deleteMessage(); } catch(e) {}
-    return ctx.reply(
-      `❌ Endi ${battle.channel} ga obuna bo'ling:`,
-      Markup.inlineKeyboard([
-        [Markup.button.url(`📢 ${battle.channel} ga obuna bo'lish`, `https://t.me/${battle.channel.replace('@', '')}`)],
-        [Markup.button.callback('✅ Obunani tekshirish', 'chk_battle_then_join')]
-      ])
-    );
-  }
-
-  try { await ctx.deleteMessage(); } catch(e) {}
-  const username = ctx.from.username;
-  if (!username) return ctx.reply('❌ Username o\'rnating.', mainMenu());
-  if (battle.participants.some(p => p.toLowerCase() === username.toLowerCase())) {
-    clearState(ctx.from.id);
-    return ctx.reply(`✅ Siz allaqachon battledasiz!`, mainMenu());
-  }
-  await doJoin(ctx, battle, username);
-});
-
-// ─── Battle kanal tekshirgandan keyin join ────────────────
-bot.action('chk_battle_then_join', async (ctx) => {
-  await ctx.answerCbQuery('Tekshirilmoqda...');
-  const state = getState(ctx.from.id);
-  if (!state?.pendingJoin) return ctx.reply('❌ Ma\'lumot topilmadi.', mainMenu());
-
-  const battle = battles[state.pendingJoin];
-  if (!battle || !battle.active) {
-    clearState(ctx.from.id); try { await ctx.deleteMessage(); } catch(e) {}
-    return ctx.reply('❌ Battle topilmadi yoki tugagan.', mainMenu());
-  }
-
-  const battleChOk = await checkBattleChannel(ctx.from.id, battle.channel);
-  if (!battleChOk) return ctx.answerCbQuery(`❌ Hali ${battle.channel} ga obuna bo'lmadingiz!`, true);
-
-  try { await ctx.deleteMessage(); } catch(e) {}
-  const username = ctx.from.username;
-  if (!username) return ctx.reply('❌ Username o\'rnating.', mainMenu());
-  if (battle.participants.some(p => p.toLowerCase() === username.toLowerCase())) {
-    clearState(ctx.from.id);
-    return ctx.reply(`✅ Siz allaqachon battledasiz!`, mainMenu());
-  }
-  await doJoin(ctx, battle, username);
-});
-
 // ============================================================
-//               RESULTS HANDLER
+//                  RESULTS HANDLER
 // ============================================================
 async function handleResults(ctx, battleId) {
   const battle = battles[battleId];
   if (!battle) return ctx.reply('❌ Battle topilmadi.');
 
   const sorted = battle.participants
-    .map(u => ({ username: u, count: getVotes(battle, u) }))
+    .map(u => ({ username: u, count: getVotesForParticipant(battle, u) }))
     .sort((a, b) => b.count - a.count);
 
   let text = `📊 <b>Battle Natijalari</b>\n\n`;
@@ -593,61 +449,83 @@ async function handleResults(ctx, battleId) {
   text += `📌 Holat: ${battle.active ? '🟢 Aktiv' : '🔴 Tugagan'}\n\n`;
   text += `📈 <b>Reyting:</b>\n\n`;
 
-  if (sorted.length === 0) text += 'Hali ishtirokchilar yo\'q.';
-  else {
+  if (sorted.length === 0) {
+    text += 'Hali ishtirokchilar yo\'q.';
+  } else {
     sorted.forEach((p, i) => {
-      const m = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
-      text += `${m} @${p.username} — ${p.count} 📦\n`;
+      const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
+      text += `${medal} @${p.username} — ${p.count} 📦\n`;
     });
   }
   await ctx.reply(text, { parse_mode: 'HTML' });
 }
 
 // ============================================================
-//               MAIN MENU HANDLERS
+//         SUBSCRIPTION CHECK CALLBACKS
+// ============================================================
+bot.action(/^chk_vote_([^_]+)_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Tekshirilmoqda...');
+  try { await ctx.deleteMessage(); } catch (e) {}
+  await handleVote(ctx, ctx.match[1], ctx.match[2]);
+});
+
+bot.action(/^chk_join_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Tekshirilmoqda...');
+  try { await ctx.deleteMessage(); } catch (e) {}
+  await handleJoin(ctx, ctx.match[1]);
+});
+
+// ============================================================
+//                  MAIN MENU HANDLERS
 // ============================================================
 bot.hears('🏆 Battle yaratish', async (ctx) => {
   const user = getUser(ctx);
-  if (user.banned) return ctx.reply('🚫 Ban qilingansiz.');
-
-  const subOk = await checkRequiredChannels(ctx.from.id);
-  if (!subOk) return ctx.reply('❌ Avval majburiy kanallarga obuna bo\'ling!', requiredChannelKeyboard());
+  if (user.banned) return ctx.reply('🚫 Siz ban qilingansiz.');
 
   setState(ctx.from.id, { step: 'battle_text' });
   await ctx.reply(
-    `🏆 <b>Battle yaratish</b>\n\n📝 Sovrin matnini kiriting:\n\nMisol:\n• 🥇 Top 1 ga gift\n• 🎁 100 Stars\n• 🏆 Premium 1 oy`,
+    `🏆 <b>Battle yaratish</b>\n\n` +
+    `📝 Battle matnini kiriting (sovrin nomi):\n\nMisol:\n• 🥇 Top 1 ga gift\n• 🎁 100 Stars\n• 🏆 Premium 1 oy`,
     { parse_mode: 'HTML', ...cancelMenu() }
   );
 });
 
 bot.hears('📋 Battlelarim', async (ctx) => {
-  const user      = getUser(ctx);
-  if (user.banned) return ctx.reply('🚫 Ban qilingansiz.');
+  const user = getUser(ctx);
+  if (user.banned) return ctx.reply('🚫 Siz ban qilingansiz.');
+
   const myBattles = getBattlesByOwner(ctx.from.id);
   if (myBattles.length === 0) return ctx.reply('📋 Sizda hali battle yo\'q.', mainMenu());
 
   const active   = myBattles.filter(b =>  b.active);
   const finished = myBattles.filter(b => !b.active);
-  const btns     = [];
+  const buttons  = [];
+
   active.forEach(b => {
     const v = Object.keys(b.votes).length;
-    btns.push([Markup.button.callback(`🟢 ${b.text.substring(0, 22)} (${v}/${b.target})`, `bm_${b.battleId}`)]);
+    buttons.push([Markup.button.callback(`🟢 ${b.text.substring(0, 22)} (${v}/${b.target})`, `bm_${b.battleId}`)]);
   });
   finished.slice(0, 5).forEach(b => {
-    btns.push([Markup.button.callback(`🔴 ${b.text.substring(0, 22)}`, `bi_${b.battleId}`)]);
+    buttons.push([Markup.button.callback(`🔴 ${b.text.substring(0, 22)}`, `bi_${b.battleId}`)]);
   });
+
   await ctx.reply(
     `📋 <b>Battlelarim</b>\n\n🟢 Aktiv: ${active.length}\n🔴 Tugagan: ${finished.length}`,
-    { parse_mode: 'HTML', ...Markup.inlineKeyboard(btns) }
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) }
   );
 });
 
 bot.hears('📊 Statistika', async (ctx) => {
-  const u = getUser(ctx);
+  const user = getUser(ctx);
   await ctx.reply(
-    `📊 <b>Statistika</b>\n\n🆔 ID: <code>${u.id}</code>\n👤 ${u.username ? '@' + u.username : 'Yo\'q'}\n\n` +
-    `🏆 Yaratgan: ${u.createdBattles || 0}\n👥 Qatnashgan: ${u.joinedBattles || 0}\n` +
-    `📦 Ovozlar: ${u.votes || 0}\n🥇 G'alabalar: ${u.wins || 0}\n😔 Mag'lubiyatlar: ${u.loses || 0}`,
+    `📊 <b>Sizning statistikangiz</b>\n\n` +
+    `🆔 ID: <code>${user.id}</code>\n` +
+    `👤 Username: ${user.username ? '@' + user.username : 'Yo\'q'}\n\n` +
+    `🏆 Yaratgan battlelar: ${user.createdBattles || 0}\n` +
+    `👥 Qatnashgan battlelar: ${user.joinedBattles || 0}\n` +
+    `📦 Yig'ilgan ovozlar: ${user.votes || 0}\n` +
+    `🥇 G'alabalar: ${user.wins || 0}\n` +
+    `😔 Mag'lubiyatlar: ${user.loses || 0}`,
     { parse_mode: 'HTML' }
   );
 });
@@ -655,11 +533,12 @@ bot.hears('📊 Statistika', async (ctx) => {
 bot.hears('ℹ️ Yordam', async (ctx) => {
   await ctx.reply(
     `ℹ️ <b>Yordam</b>\n\n` +
-    `🏆 Battle yarating → kanalingizga joylaning\n` +
-    `👥 Ishtirokchi bo'lish → <i>Konkursga qo'shilish</i> tugmasini bosing\n` +
-    `📦 Ovoz berish → ishtirokchi tugmasini bosing\n` +
+    `🏆 Battle yarating va kanalingizga joylang\n` +
+    `👥 Ishtirokchi bo'lish uchun <i>Konkursga qo'shilish</i> tugmasini bosing\n` +
+    `📦 Ovoz berish uchun ishtirokchi tugmasini bosing\n` +
     `🎯 Kim birinchi maqsadga yetsa — avto g'olib!\n\n` +
-    `⚠️ Ovoz berish uchun:\n1. Majburiy kanallarga obuna bo'ling\n2. Battle kanaliga obuna bo'ling`,
+    `🔗 Ovoz havola formati:\n` +
+    `<code>t.me/${BOT_USERNAME}?start=vote-KANAL-USERNAME</code>`,
     { parse_mode: 'HTML' }
   );
 });
@@ -670,44 +549,54 @@ bot.hears('❌ Bekor qilish', async (ctx) => {
 });
 
 // ============================================================
-//               TEXT STATE MACHINE
+//              TEXT / STATE MACHINE HANDLER
 // ============================================================
+bot.command('admin', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return; // admin bo'lmagan odamga sezilmasligi uchun jim qoladi
+
+  const totalUsers    = Object.keys(users).length;
+  const bannedUsers   = Object.values(users).filter(u => u.banned).length;
+  const totalBattles  = Object.keys(battles).length;
+  const activeBattles = Object.values(battles).filter(b => b.active).length;
+
+  return ctx.reply(
+    `⚙️ <b>Admin Panel</b>\n\n` +
+    `👥 Foydalanuvchilar: ${totalUsers}\n` +
+    `🚫 Banlangan: ${bannedUsers}\n` +
+    `🏆 Jami battlelar: ${totalBattles}\n` +
+    `🟢 Aktiv battlelar: ${activeBattles}\n\n` +
+    `📢 Majburiy kanallar:\n${settings.requiredChannels.map(c => `• ${c}`).join('\n') || 'Yo\'q'}`,
+    { parse_mode: 'HTML', ...adminPanel() }
+  );
+});
+
 bot.on('text', async (ctx) => {
   const text = ctx.message.text.trim();
-
-  // ── Secret admin command ─────────────────────────────────
-  if (text === `/${SECRET_CMD}`) {
-    const total   = Object.keys(users).length;
-    const banned  = Object.values(users).filter(u => u.banned).length;
-    const allB    = Object.keys(battles).length;
-    const activeB = Object.values(battles).filter(b => b.active).length;
-    return ctx.reply(
-      `⚙️ <b>Admin Panel</b>\n\n👥 Foydalanuvchilar: ${total}\n🚫 Banlangan: ${banned}\n` +
-      `🏆 Jami battlelar: ${allB}\n🟢 Aktiv: ${activeB}\n\n` +
-      `📢 Majburiy kanallar:\n${(settings.requiredChannels || []).map(c => `• ${c}`).join('\n') || 'Yo\'q'}`,
-      { parse_mode: 'HTML', ...adminKeyboard() }
-    );
-  }
 
   if (text.startsWith('/')) return;
 
   const user  = getUser(ctx);
   if (user.banned) return;
+
   const state = getState(ctx.from.id);
   if (!state) return;
 
-  // ── Battle creation ──────────────────────────────────────
+  // ── BATTLE CREATION ────────────────────────────────────
   if (state.step === 'battle_text') {
-    setState(ctx.from.id, { ...state, battleText: text, step: 'battle_target' });
-    return ctx.reply('✅ Saqlandi!\n\n🎯 Maqsadli ovoz sonini kiriting (masalan: 10, 50, 100):', cancelMenu());
+    state.battleText = text;
+    state.step = 'battle_target';
+    setState(ctx.from.id, state);
+    return ctx.reply('✅ Matn saqlandi!\n\n🎯 G\'olib uchun kerakli ovoz sonini kiriting:\nMisol: 10, 50, 100', cancelMenu());
   }
 
   if (state.step === 'battle_target') {
-    const n = parseInt(text);
-    if (isNaN(n) || n < 1) return ctx.reply('❌ Musbat son kiriting.');
-    setState(ctx.from.id, { ...state, battleTarget: n, step: 'battle_channel' });
+    const target = parseInt(text);
+    if (isNaN(target) || target < 1) return ctx.reply('❌ Musbat son kiriting (masalan: 10, 50, 100)');
+    state.battleTarget = target;
+    state.step = 'battle_channel';
+    setState(ctx.from.id, state);
     return ctx.reply(
-      `✅ Maqsad: ${n} ovoz\n\n📢 Kanal username kiriting:\nMisol: @mystarchannel\n\n⚠️ Bot kanalda admin bo'lishi kerak!`,
+      `✅ Maqsad: ${target} ovoz\n\n📢 Kanal username kiriting:\nMisol: @mystarchannel`,
       cancelMenu()
     );
   }
@@ -716,16 +605,27 @@ bot.on('text', async (ctx) => {
     let channel = text;
     if (!channel.startsWith('@')) channel = '@' + channel;
 
+    // --- BOT shu kanalda admin ekanligini tekshirish ---
     try {
       const me = await ctx.telegram.getChatMember(channel, ctx.botInfo.id);
       if (!['administrator', 'creator'].includes(me.status)) {
-        return ctx.reply('❌ Bot kanalda admin emas! Avval botni admin qiling.');
+        return ctx.reply('❌ Bot kanalda admin emas!\n\nIltimos, botni kanalga admin qilib qo\'shing va qaytadan urinib ko\'ring.', cancelMenu());
       }
     } catch (e) {
-      return ctx.reply(`❌ Kanal topilmadi yoki bot admin emas.\n${e.message}`, cancelMenu());
+      return ctx.reply('❌ Kanal topilmadi yoki bot kanalda admin emas.\n\nIltimos, botni kanalga admin qilib qo\'shing va qaytadan urinib ko\'ring.', cancelMenu());
     }
 
-    const battleId = Math.random().toString(36).substr(2, 8) + Date.now().toString(36);
+    // --- FOYDALANUVCHI (battle yaratuvchi) shu kanalda admin ekanligini tekshirish ---
+    try {
+      const requester = await ctx.telegram.getChatMember(channel, ctx.from.id);
+      if (!['administrator', 'creator'].includes(requester.status)) {
+        return ctx.reply('❌ Siz bu kanalda admin emassiz!\n\nIltimos, kanalda admin bo\'lib, keyin battle yarating.', cancelMenu());
+      }
+    } catch (e) {
+      return ctx.reply('❌ Siz bu kanalda admin emassiz!\n\nIltimos, kanalda admin bo\'lib, keyin battle yarating.', cancelMenu());
+    }
+
+    const battleId = generateId();
     const battle = {
       battleId, owner: ctx.from.id, channel,
       text: state.battleText, target: state.battleTarget,
@@ -734,58 +634,89 @@ bot.on('text', async (ctx) => {
     };
 
     battles[battleId] = battle;
-    users[String(ctx.from.id)].createdBattles = (users[String(ctx.from.id)].createdBattles || 0) + 1;
-    saveBattles(); saveUsers();
+    const uid = String(ctx.from.id);
+    users[uid].createdBattles = (users[uid].createdBattles || 0) + 1;
+    saveBattles();
+    saveUsers();
     clearState(ctx.from.id);
 
     try {
       const msg = await ctx.telegram.sendMessage(
-        channel, buildPost(battle),
-        { parse_mode: 'HTML', reply_markup: buildKeyboard(battle).reply_markup }
+        channel, buildBattlePost(battle),
+        { parse_mode: 'HTML', reply_markup: buildBattleKeyboard(battle).reply_markup }
       );
       battles[battleId].messageId = msg.message_id;
       saveBattles();
       await ctx.reply(
-        `✅ Battle muvaffaqiyatli yaratildi!\n\n🆔 <code>${battleId}</code>\n📢 ${channel}\n🎯 ${state.battleTarget} ovoz`,
+        `✅ Battle yaratildi!\n\n🆔 <code>${battleId}</code>\n📢 ${channel}\n🎯 ${state.battleTarget} ovoz`,
         { parse_mode: 'HTML', ...mainMenu() }
       );
     } catch (e) {
-      delete battles[battleId]; saveBattles();
+      delete battles[battleId];
+      saveBattles();
       await ctx.reply(`❌ Kanalga post yubora olmadi:\n${e.message}`, mainMenu());
     }
     return;
   }
 
-  // ── Change target ────────────────────────────────────────
+  // ── CHANGE TARGET ───────────────────────────────────────
   if (state.step === 'change_target') {
-    const n = parseInt(text);
-    if (isNaN(n) || n < 1) return ctx.reply('❌ To\'g\'ri son kiriting.');
+    const newTarget = parseInt(text);
+    if (isNaN(newTarget) || newTarget < 1) return ctx.reply('❌ To\'g\'ri son kiriting.');
     const battle = battles[state.battleId];
     if (!battle || battle.owner !== ctx.from.id) { clearState(ctx.from.id); return ctx.reply('❌ Battle topilmadi.', mainMenu()); }
     const old = battle.target;
-    battle.target = n; saveBattles(); clearState(ctx.from.id);
-    await ctx.reply(`✅ Maqsad ${old} → ${n} ga o'zgartirildi!`, mainMenu());
-    await updatePost(battle);
+    battle.target = newTarget;
+    saveBattles();
+    clearState(ctx.from.id);
+    await ctx.reply(`✅ Maqsad ${old} → ${newTarget} ga o'zgartirildi!`, mainMenu());
+    await updateBattlePost(battle);
     return;
   }
 
-  // ── Admin states ─────────────────────────────────────────
-  if (state.step === 'admin_ban')    { const t = findUserByQuery(text); clearState(ctx.from.id); if (!t) return ctx.reply('❌ Topilmadi.'); users[String(t.id)].banned = true;  saveUsers(); return ctx.reply(`🚫 @${t.username || t.id} ban.`,   mainMenu()); }
-  if (state.step === 'admin_unban')  { const t = findUserByQuery(text); clearState(ctx.from.id); if (!t) return ctx.reply('❌ Topilmadi.'); users[String(t.id)].banned = false; saveUsers(); return ctx.reply(`✅ @${t.username || t.id} unban.`, mainMenu()); }
-  if (state.step === 'admin_add_ch') {
-    let ch = text; if (!ch.startsWith('@')) ch = '@' + ch;
-    if (!(settings.requiredChannels || []).includes(ch)) {
-      settings.requiredChannels = [...(settings.requiredChannels || []), ch];
-      saveSettings();
-    }
+  // ── ADMIN STATES ─────────────────────────────────────────
+  if (state.step === 'admin_ban_user') {
+    const target = findUserByQuery(text);
+    if (!target) { clearState(ctx.from.id); return ctx.reply('❌ Topilmadi.', mainMenu()); }
+    users[String(target.id)].banned = true;
+    saveUsers();
+    clearState(ctx.from.id);
+    return ctx.reply(`🚫 @${target.username || target.id} ban qilindi.`, mainMenu());
+  }
+
+  if (state.step === 'admin_unban_user') {
+    const target = findUserByQuery(text);
+    if (!target) { clearState(ctx.from.id); return ctx.reply('❌ Topilmadi.', mainMenu()); }
+    users[String(target.id)].banned = false;
+    saveUsers();
+    clearState(ctx.from.id);
+    return ctx.reply(`✅ @${target.username || target.id} unban qilindi.`, mainMenu());
+  }
+
+  if (state.step === 'admin_add_channel') {
+    let ch = text;
+    if (!ch.startsWith('@')) ch = '@' + ch;
+    if (!settings.requiredChannels.includes(ch)) { settings.requiredChannels.push(ch); saveSettings(); }
     clearState(ctx.from.id);
     return ctx.reply(`✅ ${ch} majburiy kanallarga qo'shildi.`, mainMenu());
   }
-  if (state.step === 'admin_broadcast') return sendBroadcast(ctx, ctx.message.message_id);
+
+  if (state.step === 'admin_remove_channel') {
+    let ch = text;
+    if (!ch.startsWith('@')) ch = '@' + ch;
+    settings.requiredChannels = settings.requiredChannels.filter(c => c !== ch);
+    saveSettings();
+    clearState(ctx.from.id);
+    return ctx.reply(`✅ ${ch} o'chirildi.`, mainMenu());
+  }
+
+  if (state.step === 'admin_broadcast') {
+    return sendBroadcast(ctx, ctx.message.message_id);
+  }
 });
 
 // ============================================================
-//               MEDIA BROADCAST
+//              MEDIA BROADCAST HANDLER
 // ============================================================
 bot.on(['photo', 'video', 'animation', 'sticker', 'document', 'voice', 'audio'], async (ctx) => {
   const state = getState(ctx.from.id);
@@ -807,107 +738,23 @@ async function sendBroadcast(ctx, messageId) {
 }
 
 // ============================================================
-//               ADMIN KEYBOARD
-// ============================================================
-const adminKeyboard = () => Markup.inlineKeyboard([
-  [Markup.button.callback('📢 Broadcast',          'adm_bc')],
-  [Markup.button.callback('🚫 Ban',                'adm_ban'),       Markup.button.callback('✅ Unban', 'adm_unban')],
-  [Markup.button.callback('📊 Statistika',         'adm_stats')],
-  [Markup.button.callback('📋 Battlelar',          'adm_battles')],
-  [Markup.button.callback('➕ Kanal qo\'shish',    'adm_addch'),     Markup.button.callback('➖ Kanal o\'chirish', 'adm_rmch')]
-]);
-
-bot.action('adm_bc', async (ctx) => {
-  setState(ctx.from.id, { step: 'admin_broadcast' });
-  await ctx.answerCbQuery();
-  await ctx.reply('📢 Broadcast xabarini yuboring (matn, rasm, video, gif, stiker...):', cancelMenu());
-});
-
-bot.action('adm_ban', async (ctx) => {
-  setState(ctx.from.id, { step: 'admin_ban' });
-  await ctx.answerCbQuery();
-  await ctx.reply('🚫 Ban qilish uchun @username yoki ID:', cancelMenu());
-});
-
-bot.action('adm_unban', async (ctx) => {
-  setState(ctx.from.id, { step: 'admin_unban' });
-  await ctx.answerCbQuery();
-  await ctx.reply('✅ Unban uchun @username yoki ID:', cancelMenu());
-});
-
-bot.action('adm_stats', async (ctx) => {
-  await ctx.answerCbQuery();
-  const total   = Object.keys(users).length;
-  const banned  = Object.values(users).filter(u => u.banned).length;
-  const allB    = Object.keys(battles).length;
-  const activeB = Object.values(battles).filter(b => b.active).length;
-  const votes   = Object.values(battles).reduce((a, b) => a + Object.keys(b.votes).length, 0);
-  await ctx.editMessageText(
-    `📊 <b>Statistika</b>\n\n👥 Foydalanuvchilar: ${total}\n🚫 Banlangan: ${banned}\n` +
-    `🏆 Jami battlelar: ${allB}\n🟢 Aktiv: ${activeB}\n📦 Jami ovozlar: ${votes}\n\n` +
-    `📢 Majburiy kanallar:\n${(settings.requiredChannels || []).map(c => `• ${c}`).join('\n') || 'Yo\'q'}`,
-    { parse_mode: 'HTML' }
-  );
-});
-
-bot.action('adm_battles', async (ctx) => {
-  await ctx.answerCbQuery();
-  const all = Object.values(battles);
-  let text = `📋 <b>Battlelar</b> (${all.length})\n\n`;
-  if (all.length === 0) text += 'Yo\'q.';
-  else all.slice(0, 20).forEach(b => {
-    const v = Object.keys(b.votes).length;
-    text += `${b.active ? '🟢' : '🔴'} ${b.text.substring(0, 20)} | ${b.channel} | ${v}/${b.target}\n`;
-  });
-  await ctx.editMessageText(text, { parse_mode: 'HTML' });
-});
-
-bot.action('adm_addch', async (ctx) => {
-  setState(ctx.from.id, { step: 'admin_add_ch' });
-  await ctx.answerCbQuery();
-  await ctx.reply('➕ Kanal username kiriting (@kanal):', cancelMenu());
-});
-
-bot.action('adm_rmch', async (ctx) => {
-  await ctx.answerCbQuery();
-  const chs = settings.requiredChannels || [];
-  if (chs.length === 0) return ctx.reply('Majburiy kanallar yo\'q.', mainMenu());
-  const btns = chs.map((ch, i) => [Markup.button.callback(`❌ ${ch}`, `rmch_${i}`)]);
-  await ctx.editMessageText('O\'chirish uchun kanalni tanlang:', { reply_markup: Markup.inlineKeyboard(btns).reply_markup });
-});
-
-bot.action(/^rmch_(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const idx = parseInt(ctx.match[1]);
-  const chs = settings.requiredChannels || [];
-  const ch  = chs[idx];
-  settings.requiredChannels = chs.filter((_, i) => i !== idx);
-  saveSettings();
-  await ctx.editMessageText(`✅ ${ch} o'chirildi.`);
-});
-
-// ============================================================
-//               BATTLE MANAGEMENT CALLBACKS
+//              BATTLE MANAGEMENT CALLBACKS
 // ============================================================
 bot.action(/^bm_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const battle = battles[ctx.match[1]];
   if (!battle || battle.owner !== ctx.from.id) return;
+
   const v = Object.keys(battle.votes).length;
   await ctx.editMessageText(
-    `📋 <b>Battle Boshqaruvi</b>\n\n🎁 ${battle.text}\n🎯 Maqsad: ${battle.target}\n` +
-    `👥 Ishtirokchilar: ${battle.participants.length}\n📦 Ovozlar: ${v}\n📢 ${battle.channel}\n` +
-    `📌 ${battle.active ? '🟢 Aktiv' : '🔴 Tugagan'}`,
-    {
-      parse_mode: 'HTML',
-      reply_markup: Markup.inlineKeyboard([
-        [Markup.button.callback('📊 Natijalar',             `bi_${battle.battleId}`)],
-        [Markup.button.callback('🎯 Maqsadni o\'zgartirish',`bc_${battle.battleId}`)],
-        [Markup.button.callback('⛔ Battle stop',           `bs_${battle.battleId}`)],
-        [Markup.button.callback('🔄 Yangilash',             `bm_${battle.battleId}`)],
-        [Markup.button.callback('◀️ Orqaga',               'back_battles')]
-      ]).reply_markup
-    }
+    `📋 <b>Battle Boshqaruvi</b>\n\n🎁 ${battle.text}\n🎯 Maqsad: ${battle.target}\n👥 Ishtirokchilar: ${battle.participants.length}\n📦 Ovozlar: ${v}\n📢 ${battle.channel}\n📌 ${battle.active ? '🟢 Aktiv' : '🔴 Tugagan'}`,
+    { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([
+      [Markup.button.callback('📊 Natijalar', `bi_${battle.battleId}`)],
+      [Markup.button.callback('🎯 Maqsadni o\'zgartirish', `bc_${battle.battleId}`)],
+      [Markup.button.callback('⛔ Battle stop', `bs_${battle.battleId}`)],
+      [Markup.button.callback('🔄 Yangilash', `bm_${battle.battleId}`)],
+      [Markup.button.callback('◀️ Orqaga', 'back_battles')]
+    ]).reply_markup }
   );
 });
 
@@ -915,16 +762,16 @@ bot.action(/^bi_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const battle = battles[ctx.match[1]];
   if (!battle) return;
+
   const sorted = battle.participants
-    .map(u => ({ username: u, count: getVotes(battle, u) }))
+    .map(u => ({ username: u, count: getVotesForParticipant(battle, u) }))
     .sort((a, b) => b.count - a.count);
+
   let text = `📊 <b>Natijalar</b>\n\n🎁 ${battle.text}\n🎯 Maqsad: ${battle.target}\n\n📈 <b>Reyting:</b>\n\n`;
-  if (sorted.length === 0) text += 'Hali ishtirokchilar yo\'q.';
-  else sorted.forEach((p, i) => { const m = i===0?'🥇':i===1?'🥈':i===2?'🥉':`${i+1}.`; text += `${m} @${p.username} — ${p.count} 📦\n`; });
-  await ctx.editMessageText(text, {
-    parse_mode: 'HTML',
-    reply_markup: Markup.inlineKeyboard([[Markup.button.callback('◀️ Orqaga', `bm_${battle.battleId}`)]]).reply_markup
-  });
+  if (sorted.length === 0) { text += 'Hali ishtirokchilar yo\'q.'; }
+  else { sorted.forEach((p, i) => { const m = i===0?'🥇':i===1?'🥈':i===2?'🥉':`${i+1}.`; text += `${m} @${p.username} — ${p.count} 📦\n`; }); }
+
+  await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('◀️ Orqaga', `bm_${battle.battleId}`)]]).reply_markup });
 });
 
 bot.action(/^bc_(.+)$/, async (ctx) => {
@@ -936,50 +783,113 @@ bot.action(/^bc_(.+)$/, async (ctx) => {
 });
 
 bot.action(/^bs_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery('⛔ To\'xtatildi.');
+  await ctx.answerCbQuery('⛔ Battle to\'xtatildi.');
   const battle = battles[ctx.match[1]];
   if (!battle || battle.owner !== ctx.from.id) return;
-  battle.active = false; saveBattles();
-  try { await bot.telegram.sendMessage(battle.channel, `⛔ <b>Battle to'xtatildi</b>\n\n🎁 Sovrin: ${battle.text}`, { parse_mode: 'HTML' }); } catch(e) {}
-  await ctx.editMessageText('⛔ Battle to\'xtatildi.', {
-    reply_markup: Markup.inlineKeyboard([[Markup.button.callback('◀️ Orqaga', 'back_battles')]]).reply_markup
-  });
+  battle.active = false;
+  saveBattles();
+  try { await bot.telegram.sendMessage(battle.channel, `⛔ <b>Battle to'xtatildi</b>\n\n🎁 Sovrin: ${battle.text}`, { parse_mode: 'HTML' }); } catch (e) {}
+  await ctx.editMessageText('⛔ Battle to\'xtatildi.', { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('◀️ Orqaga', 'back_battles')]]).reply_markup });
 });
 
 bot.action('back_battles', async (ctx) => {
   await ctx.answerCbQuery();
   const myBattles = getBattlesByOwner(ctx.from.id);
-  const active    = myBattles.filter(b =>  b.active);
-  const finished  = myBattles.filter(b => !b.active);
-  const btns      = [];
-  active.forEach(b => { const v = Object.keys(b.votes).length; btns.push([Markup.button.callback(`🟢 ${b.text.substring(0,22)} (${v}/${b.target})`, `bm_${b.battleId}`)]); });
-  finished.slice(0,5).forEach(b => { btns.push([Markup.button.callback(`🔴 ${b.text.substring(0,22)}`, `bi_${b.battleId}`)]); });
+  const active = myBattles.filter(b => b.active);
+  const finished = myBattles.filter(b => !b.active);
+  const buttons = [];
+  active.forEach(b => { const v=Object.keys(b.votes).length; buttons.push([Markup.button.callback(`🟢 ${b.text.substring(0,22)} (${v}/${b.target})`, `bm_${b.battleId}`)]); });
+  finished.slice(0,5).forEach(b => { buttons.push([Markup.button.callback(`🔴 ${b.text.substring(0,22)}`, `bi_${b.battleId}`)]); });
   await ctx.editMessageText(
     `📋 <b>Battlelarim</b>\n\n🟢 Aktiv: ${active.length}\n🔴 Tugagan: ${finished.length}`,
-    { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard(btns).reply_markup }
+    { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard(buttons).reply_markup }
   );
 });
 
+// ── REMOVE REQUIRED CHANNEL ────────────────────────────────
+bot.action(/^rch_(.+)$/, async (ctx) => {
+  const ch = ctx.match[1];
+  settings.requiredChannels = settings.requiredChannels.filter(c => c !== ch);
+  saveSettings();
+  await ctx.answerCbQuery(`✅ ${ch} o'chirildi.`);
+  await ctx.editMessageText(`✅ ${ch} majburiy kanallardan o'chirildi.`);
+});
+
 // ============================================================
-//               ERROR HANDLER
+//              ADMIN CALLBACKS
+// ============================================================
+bot.action('admin_broadcast', async (ctx) => {
+  await ctx.answerCbQuery();
+  setState(ctx.from.id, { step: 'admin_broadcast' });
+  await ctx.reply('📢 Broadcast xabarini yuboring (matn, rasm, video, gif, stiker...):', cancelMenu());
+});
+
+bot.action('admin_ban', async (ctx) => {
+  await ctx.answerCbQuery();
+  setState(ctx.from.id, { step: 'admin_ban_user' });
+  await ctx.reply('🚫 Ban qilish uchun user ID yoki @username:', cancelMenu());
+});
+
+bot.action('admin_unban', async (ctx) => {
+  await ctx.answerCbQuery();
+  setState(ctx.from.id, { step: 'admin_unban_user' });
+  await ctx.reply('✅ Unban qilish uchun user ID yoki @username:', cancelMenu());
+});
+
+bot.action('admin_stats', async (ctx) => {
+  await ctx.answerCbQuery();
+  const totalVotes = Object.values(battles).reduce((a, b) => a + Object.keys(b.votes).length, 0);
+  await ctx.editMessageText(
+    `📊 <b>Bot Statistikasi</b>\n\n` +
+    `👥 Foydalanuvchilar: ${Object.keys(users).length}\n` +
+    `🚫 Banlangan: ${Object.values(users).filter(u=>u.banned).length}\n` +
+    `🏆 Jami battlelar: ${Object.keys(battles).length}\n` +
+    `🟢 Aktiv: ${Object.values(battles).filter(b=>b.active).length}\n` +
+    `📦 Jami ovozlar: ${totalVotes}\n\n` +
+    `📢 Majburiy kanallar:\n${settings.requiredChannels.map(c=>`• ${c}`).join('\n')||'Yo\'q'}`,
+    { parse_mode: 'HTML' }
+  );
+});
+
+bot.action('admin_battles', async (ctx) => {
+  await ctx.answerCbQuery();
+  const all = Object.values(battles);
+  let text = `📋 <b>Barcha Battlelar</b> (${all.length})\n\n`;
+  if (all.length === 0) { text += 'Hali battle yo\'q.'; }
+  else { all.slice(0,20).forEach(b => { const v=Object.keys(b.votes).length; text += `${b.active?'🟢':'🔴'} ${b.text.substring(0,20)} | ${b.channel} | ${v}/${b.target}\n`; }); }
+  await ctx.editMessageText(text, { parse_mode: 'HTML' });
+});
+
+bot.action('admin_add_channel', async (ctx) => {
+  await ctx.answerCbQuery();
+  setState(ctx.from.id, { step: 'admin_add_channel' });
+  await ctx.reply('➕ Majburiy kanal username kiriting (@kanal):', cancelMenu());
+});
+
+bot.action('admin_remove_channel', async (ctx) => {
+  await ctx.answerCbQuery();
+  if (settings.requiredChannels.length === 0) return ctx.reply('Majburiy kanallar yo\'q.');
+  const buttons = settings.requiredChannels.map(ch => [Markup.button.callback(`❌ ${ch}`, `rch_${ch}`)]);
+  await ctx.editMessageText('➖ O\'chirish uchun kanalni tanlang:', { reply_markup: Markup.inlineKeyboard(buttons).reply_markup });
+});
+
+// ============================================================
+//                    ERROR HANDLER
 // ============================================================
 bot.catch((err, ctx) => {
-  console.error('[ERROR]', err.message || err);
+  console.error(`[ERROR]:`, err.message || err);
   try {
-    if (ctx.callbackQuery) ctx.answerCbQuery('❌ Xato.').catch(() => {});
-    else ctx.reply('❌ Xato yuz berdi.').catch(() => {});
+    if (ctx.callbackQuery) ctx.answerCbQuery('❌ Xato yuz berdi.').catch(()=>{});
+    else ctx.reply('❌ Xato yuz berdi.').catch(()=>{});
   } catch (_) {}
 });
 
 // ============================================================
-//                    LAUNCH
+//                      LAUNCH
 // ============================================================
 bot.launch({ allowedUpdates: ['message', 'callback_query'] })
-  .then(() => {
-    console.log(`✅ Stars Battle Bot ishga tushdi! @${BOT_USERNAME}`);
-    console.log(`🔑 Admin panel: /${SECRET_CMD}`);
-  })
-  .catch(err => { console.error('❌ Xato:', err.message); process.exit(1); });
+  .then(() => console.log(`✅ Ovoz Battle Bot ishga tushdi! @${BOT_USERNAME}\n🔑 Admin panel: /admin (ADMIN_IDS: ${ADMIN_IDS.join(', ') || 'belgilanmagan'})`))
+  .catch(err => { console.error('❌ Bot ishga tushmadi:', err.message); process.exit(1); });
 
 process.once('SIGINT',  () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
